@@ -126,6 +126,7 @@ mod m20260604_000001_add_kind_to_pipeline;
 mod m20260622_000001_add_org_id_to_short_urls;
 mod m20260624_000001_create_synthetics_monitors;
 mod m20260624_000002_create_synthetics_pending_checks;
+mod m20260624_000003_fix_synthetics_pending_checks_dedup;
 
 pub struct Migrator;
 
@@ -241,6 +242,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260622_000001_add_org_id_to_short_urls::Migration),
             Box::new(m20260624_000001_create_synthetics_monitors::Migration),
             Box::new(m20260624_000002_create_synthetics_pending_checks::Migration),
+            Box::new(m20260624_000003_fix_synthetics_pending_checks_dedup::Migration),
         ]
     }
 }
