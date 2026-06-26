@@ -333,6 +333,7 @@ import Plagiarism from "~icons/material-symbols/plagiarism-outline";
 import Redo from "~icons/material-symbols/redo";
 import Tab from "~icons/material-symbols/tab-outline";
 import Web from "~icons/material-symbols/web";
+import SmartDisplay from "~icons/material-symbols/smart-display-outline";
 
 import type { Component } from "vue";
 
@@ -662,6 +663,7 @@ export const iconRegistry = {
   "keyboard": Keyboard,
   "checklist": Checklist,
   "photo-camera": PhotoCamera,
+  "smart-display": SmartDisplay,
 } as const satisfies Record<string, Component>;
 
 export type IconName = keyof typeof iconRegistry;
