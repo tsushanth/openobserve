@@ -49,6 +49,7 @@ import EmptyUsers from "./EmptyUsers.vue";
 import EmptyReport from "./EmptyReport.vue";
 import EmptyQuery from "./EmptyQuery.vue";
 import EmptyAlert from "./EmptyAlert.vue";
+import EmptyBrowserCheck from "./EmptyBrowserCheck.vue";
 import EmptyExplorer from "./EmptyExplorer.vue";
 import EmptyServiceGraph from "./EmptyServiceGraph.vue";
 import EmptyServicesCatalog from "./EmptyServicesCatalog.vue";
@@ -73,6 +74,7 @@ export const illustrations = {
   report: EmptyReport,
   query: EmptyQuery,
   alert: EmptyAlert,
+  "browser-check": EmptyBrowserCheck,
   // ---- character scenes (opt-in — use ONLY where a person adds value) ------
   explorer: EmptyExplorer,
   // ---- earlier geometric experiments (kept for reference) ------------------
