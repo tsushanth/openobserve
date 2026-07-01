@@ -177,6 +177,8 @@ async fn get_wal_batches(
             partition: 0,           // set in FlightSearchRequest
             job_id: "".to_string(), // set in FlightSearchRequest
             enrich_mode: false,
+            doget_index: 0,
+            doget_count: 1,
         },
         search_infos: SearchInfos {
             plan: vec![],         // set in RemoteScanNode

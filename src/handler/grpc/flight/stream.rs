@@ -41,6 +41,9 @@ pub struct FlightEncoderStreamBuilder {
     is_super: bool,
     defer_lock: Option<DeferredLock>,
     start: std::time::Instant,
+    /// When several do_get streams share one execution (do_get fan-out), only the shared owner
+    /// clears the session / releases the slot. The per-stream encoders skip that cleanup.
+    skip_session_cleanup: bool,
 }
 
 impl FlightEncoderStreamBuilder {
@@ -53,6 +56,7 @@ impl FlightEncoderStreamBuilder {
             is_super: false,
             defer_lock: None,
             start: std::time::Instant::now(),
+            skip_session_cleanup: false,
         }
     }
 
@@ -78,6 +82,12 @@ impl FlightEncoderStreamBuilder {
 
     pub fn with_start(mut self, start: std::time::Instant) -> Self {
         self.start = start;
+        self
+    }
+
+    /// Skip session/slot cleanup on drop; the shared execution owner cleans up once instead.
+    pub fn with_skip_session_cleanup(mut self, skip: bool) -> Self {
+        self.skip_session_cleanup = skip;
         self
     }
 
@@ -136,11 +146,12 @@ impl FlightEncoderStreamBuilder {
             ctx: StreamContext {
                 trace_id: self.trace_id,
                 is_super: self.is_super,
+                defer_lock: self.defer_lock,
+                skip_session_cleanup: self.skip_session_cleanup,
                 start: self.start,
                 span,
                 child_span,
                 tasks,
-                defer_lock: self.defer_lock,
             },
             log: EventLog::new(config::get_config().common.print_key_event),
         }
@@ -172,13 +183,14 @@ pub struct FlightEncoderStream {
 struct StreamContext {
     trace_id: String,
     is_super: bool,
+    /// set only for super cluster follower leader.
+    defer_lock: Option<DeferredLock>,
+    skip_session_cleanup: bool,
     start: std::time::Instant,
     span: tracing::Span,
     child_span: tracing::Span,
     /// per-partition encoder tasks; drained so panics fail the stream.
     tasks: JoinSet<()>,
-    /// set only for super cluster follower leader.
-    defer_lock: Option<DeferredLock>,
 }
 
 struct EventLog {
@@ -374,6 +386,12 @@ impl Drop for FlightEncoderStream {
         metrics::GRPC_INCOMING_REQUESTS
             .with_label_values(&["/search/flight/do_get", "200", "", "", "", ""])
             .inc();
+
+        // When this stream is one of several sharing a single execution (do_get fan-out), the
+        // shared owner releases the slot / clears the session exactly once, so skip it here.
+        if ctx.skip_session_cleanup {
+            return;
+        }
 
         // Release the node-level slot reservation for this Follow node.
         #[cfg(feature = "enterprise")]

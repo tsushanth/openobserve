@@ -59,6 +59,7 @@ use crate::{
     },
 };
 
+mod doget_registry;
 mod partition_encoder;
 mod stream;
 pub mod visitor;
@@ -104,6 +105,69 @@ impl FlightService for FlightServiceImpl {
         let is_super_cluster = req.super_cluster_info.is_super_cluster;
         let timeout = req.search_info.timeout as u64;
         log::info!("[trace_id {trace_id}] flight->search: do_get, timeout: {timeout}s",);
+
+        // do_get fan-out: the leader opens several parallel streams to this follower, all sharing
+        // one job_id (hence one trace_id). They share a single execution and split its per-bucket
+        // output streams; the first request builds it, the rest take their group. EXPERIMENTAL,
+        // gated behind ZO_FEATURE_FLIGHT_DOGET_FANOUT_ENABLED.
+        let doget_count = req.query_identifier.doget_count as usize;
+        let doget_index = req.query_identifier.doget_index as usize;
+        if cfg.common.feature_flight_doget_fanout_enabled && doget_count > 1 {
+            let shared = doget_registry::get_or_build(trace_id.clone(), {
+                let trace_id = trace_id.clone();
+                let req = req.clone();
+                let span = span.clone();
+                move || build_shared_exec(trace_id, req, span)
+            })
+            .await?;
+
+            let my_streams = shared.take_group(doget_index, doget_count);
+            // report per-execution stats/metrics/lock exactly once, on the first stream
+            let custom_messages = if doget_index == 0 {
+                shared.take_custom_messages()
+            } else {
+                Vec::new()
+            };
+
+            let start = std::time::Instant::now();
+            let write_options: IpcWriteOptions = IpcWriteOptions::default()
+                .try_with_compression(Some(CompressionType::ZSTD))
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let mut builder = FlightEncoderStreamBuilder::new(write_options, 33554432)
+                .with_trace_id(trace_id.to_string())
+                .with_is_super(is_super_cluster)
+                // the shared execution owns session/slot cleanup for all its streams
+                .with_skip_session_cleanup(true)
+                .with_start(start);
+            for message in custom_messages {
+                builder = builder.with_custom_message(message);
+            }
+            let mut encoder = builder.build(my_streams, span);
+
+            let stream = async_stream::stream! {
+                // keep the shared execution alive until this response finishes; the last response
+                // to drop its handle runs the one-time session/slot cleanup
+                let _shared = shared;
+                let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(timeout));
+                pin_mut!(timeout);
+                loop {
+                    tokio::select! {
+                        batch = encoder.next() => {
+                            if let Some(batch) = batch {
+                                yield batch
+                            } else {
+                                break;
+                            }
+                        }
+                        _ = &mut timeout => {
+                            log::info!("[trace_id {trace_id}] flight->search: timeout");
+                            break;
+                        }
+                    }
+                }
+            };
+            return Ok(Response::new(Box::pin(stream) as Self::DoGetStream));
+        }
 
         // Note: all async should in this place, otherwise it will break tracing
         // https://docs.rs/tracing/latest/tracing/span/struct.Span.html#in-asynchronous-code
@@ -359,6 +423,87 @@ async fn get_ctx_and_physical_plan(
 ) -> Result<PlanResult, infra::errors::Error> {
     let (ctx, physical_plan, scan_stats) = grpcFlight::search(trace_id, req).await?;
     Ok((ctx, physical_plan, None, scan_stats))
+}
+
+/// Build one shared follower execution for the do_get fan-out: prepare the context and physical
+/// plan, execute it into per-partition streams, and gather the leader-facing custom messages.
+/// Runs exactly once per (trace_id, job_id); the parallel do_get requests share the result.
+async fn build_shared_exec(
+    trace_id: String,
+    req: FlightSearchRequest,
+    span: tracing::Span,
+) -> Result<Arc<doget_registry::SharedExec>, Status> {
+    let is_super_cluster = req.super_cluster_info.is_super_cluster;
+
+    let result = async {
+        #[cfg(feature = "enterprise")]
+        if is_super_cluster && !SEARCH_SERVER.contain_key(&trace_id).await {
+            SEARCH_SERVER
+                .insert(trace_id.clone(), TaskStatus::new_follower(vec![], false))
+                .await;
+        }
+        let result = get_ctx_and_physical_plan(&trace_id, &req).await;
+        #[cfg(feature = "enterprise")]
+        if is_super_cluster && !SEARCH_SERVER.is_leader(&trace_id).await {
+            SEARCH_SERVER.remove(&trace_id, false).await;
+        }
+        result
+    }
+    .instrument(span.clone())
+    .await;
+
+    let (ctx, physical_plan, lock, scan_stats) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            clear_session_data(&trace_id);
+            #[cfg(feature = "enterprise")]
+            if get_o2_config().work_group.max_nodes_per_query > 0 {
+                o2_enterprise::enterprise::search::admission::ledger::release(&trace_id);
+            }
+            return Err(Status::internal(e.to_string()));
+        }
+    };
+
+    let peak_memory = get_peak_memory_from_ctx(&ctx);
+    let scan_stats_ref = get_scan_stats(&physical_plan);
+    let metrics_ref = get_cluster_metrics(&physical_plan);
+    let peak_memory_ref = get_peak_memory(&physical_plan);
+    let partial_err_ref = get_partial_err(&physical_plan);
+    let metrics = req.search_info.is_analyze.then_some(MetricsInfo {
+        plan: physical_plan.clone(),
+        is_super_cluster,
+        func: Box::new(super_cluster_enabled),
+    });
+
+    // one stream per output partition (bucket) so they encode in parallel
+    let streams =
+        execute_stream_partitioned(physical_plan, ctx.task_ctx().clone()).map_err(|e| {
+            clear_session_data(&trace_id);
+            #[cfg(feature = "enterprise")]
+            if get_o2_config().work_group.max_nodes_per_query > 0 {
+                o2_enterprise::enterprise::search::admission::ledger::release(&trace_id);
+            }
+            Status::internal(e.to_string())
+        })?;
+
+    let custom_messages = vec![
+        PreCustomMessage::ScanStats(scan_stats),
+        PreCustomMessage::ScanStatsRef(scan_stats_ref),
+        PreCustomMessage::Metrics(metrics),
+        PreCustomMessage::MetricsRef(metrics_ref),
+        PreCustomMessage::PeakMemoryRef(Some(peak_memory)),
+        PreCustomMessage::PeakMemoryRef(peak_memory_ref),
+        PreCustomMessage::PartialErrRefEarly(partial_err_ref.clone()),
+        PreCustomMessage::PartialErrRef(partial_err_ref),
+    ];
+
+    Ok(doget_registry::new_shared(
+        trace_id,
+        ctx,
+        streams,
+        custom_messages,
+        lock,
+    ))
 }
 
 fn clear_session_data(trace_id: &str) {

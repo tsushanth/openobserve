@@ -88,6 +88,8 @@ message QueryIdentifier {
     uint32                      partition = 4; // the partition number of the remote scan
     string                         job_id = 5; // the unique id for each remote scan
     bool                      enrich_mode = 6; // need special logic for loading enrich table
+    uint32                   doget_index = 7; // which bucket-group this do_get streams back (0-based)
+    uint32                   doget_count = 8; // total do_get streams the leader opens to this node (1 = no fan-out)
 }
 
 message SearchInfo {

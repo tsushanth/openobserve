@@ -144,6 +144,13 @@ impl FlightSearchRequest {
     pub fn set_job_id(&mut self, job_id: String) {
         self.query_identifier.job_id = job_id;
     }
+
+    // used in RemoteScanExec do_get fan-out: which bucket-group this stream carries, and the
+    // total number of streams the leader opens to this node (1 = no fan-out, current behavior).
+    pub fn set_doget(&mut self, index: usize, count: usize) {
+        self.query_identifier.doget_index = index as u32;
+        self.query_identifier.doget_count = count as u32;
+    }
 }
 
 impl From<cluster_rpc::FlightSearchRequest> for FlightSearchRequest {

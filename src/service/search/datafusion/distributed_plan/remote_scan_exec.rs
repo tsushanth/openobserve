@@ -28,7 +28,7 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_expr::{EquivalenceProperties, Partitioning},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         metrics::{ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
@@ -55,6 +55,11 @@ pub struct RemoteScanExec {
     input: Arc<dyn ExecutionPlan>,
     remote_scan_node: RemoteScanNode,
     partitions: usize,
+    /// Number of parallel do_get streams opened per follower node (1 = no fan-out).
+    n_doget: usize,
+    /// Shared job_id for all do_get streams of this scan, so the follower can key one shared
+    /// execution on it. `None` when not fanning out (each do_get keeps its own random job_id).
+    shared_job_id: Option<String>,
     cache: Arc<PlanProperties>,
     pub scan_stats: Arc<Mutex<ScanStats>>,
     pub peak_memory: Arc<AtomicUsize>,
@@ -70,7 +75,21 @@ impl RemoteScanExec {
         input: Arc<dyn ExecutionPlan>,
         mut remote_scan_node: RemoteScanNode,
     ) -> Result<Self> {
-        let output_partitions = remote_scan_node.nodes.len();
+        let num_nodes = remote_scan_node.nodes.len();
+        // Fan out N parallel do_get streams per node when enabled, splitting the follower's
+        // bucket count across the nodes so total streams (num_nodes * n_doget) tracks the
+        // leader's target partitions instead of N-per-node.
+        let n_doget = compute_n_doget(
+            config::get_config()
+                .common
+                .feature_flight_doget_fanout_enabled,
+            input.output_partitioning().partition_count(),
+            num_nodes,
+        );
+        let output_partitions = num_nodes * n_doget;
+        // All do_get streams to the same node share one job_id so the follower can key a single
+        // shared execution on it. Only needed when actually fanning out.
+        let shared_job_id = (n_doget > 1).then(|| generate_random_string(7));
         let cache = Self::compute_properties(Arc::clone(&input.schema()), output_partitions);
 
         // serialize the input plan and set it as the plan for the remote scan node
@@ -94,6 +113,8 @@ impl RemoteScanExec {
             input,
             remote_scan_node,
             partitions: output_partitions,
+            n_doget,
+            shared_job_id,
             cache,
             scan_stats: Arc::new(Mutex::new(ScanStats::default())),
             partial_err: Arc::new(Mutex::new(String::new())),
@@ -237,11 +258,17 @@ impl ExecutionPlan for RemoteScanExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // partition p maps to (node p / n_doget, bucket-group p % n_doget)
+        let node_idx = partition / self.n_doget;
+        let doget_idx = partition % self.n_doget;
         let baseline_metrics = RemoteScanMetrics::new(partition, &self.metrics);
         let fut = get_remote_batch(
             self.remote_scan_node.clone(),
-            partition,
-            partition == self.enrich_mode_node_idx,
+            node_idx,
+            doget_idx,
+            self.n_doget,
+            self.shared_job_id.clone(),
+            node_idx == self.enrich_mode_node_idx,
             self.input.schema().clone(),
             self.scan_stats(),
             self.partial_err(),
@@ -261,10 +288,27 @@ impl ExecutionPlan for RemoteScanExec {
     }
 }
 
+/// Number of parallel do_get streams to open per follower node.
+///
+/// When fan-out is disabled this is always 1 (one stream per node, the original behavior).
+/// When enabled, the follower's `bucket_count` is split across the `num_nodes` followers so the
+/// total stream count (`num_nodes * n_doget`) tracks the leader's target partitions rather than
+/// opening `bucket_count` streams to every node (which would oversubscribe the leader's decode).
+/// The result is always >= 1.
+fn compute_n_doget(fanout_enabled: bool, bucket_count: usize, num_nodes: usize) -> usize {
+    if !fanout_enabled {
+        return 1;
+    }
+    (bucket_count / num_nodes.max(1)).max(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn get_remote_batch(
     remote_scan_node: RemoteScanNode,
-    partition: usize,
+    node_idx: usize,
+    doget_idx: usize,
+    n_doget: usize,
+    shared_job_id: Option<String>,
     enrich_mode: bool,
     schema: SchemaRef,
     scan_stats: Arc<Mutex<ScanStats>>,
@@ -278,7 +322,7 @@ async fn get_remote_batch(
     let trace_id = remote_scan_node.query_identifier.trace_id.clone();
     let org_id = remote_scan_node.query_identifier.org_id.clone();
     let context = remote_scan_node.opentelemetry_context.clone();
-    let node = remote_scan_node.nodes[partition].clone();
+    let node = remote_scan_node.nodes[node_idx].clone();
     let is_super = remote_scan_node.super_cluster_info.is_super_cluster;
     let is_querier = node.is_querier();
     let is_ingester = node.is_ingester();
@@ -319,14 +363,20 @@ async fn get_remote_batch(
         && is_querier
         && !is_ingester
         && !enrich_mode
-        && remote_scan_node.is_file_list_empty(partition)
+        && remote_scan_node.is_file_list_empty(node_idx)
     {
         return Ok(get_empty_stream(empty_stream));
     }
 
-    let mut request = remote_scan_node.get_flight_search_request(partition);
-    request.set_job_id(generate_random_string(7));
-    request.set_partition(partition);
+    let mut request = remote_scan_node.get_flight_search_request(node_idx);
+    // All do_get streams of one scan-node share a job_id so the follower can key one shared
+    // execution; without fan-out each request keeps its own random job_id (current behavior).
+    match &shared_job_id {
+        Some(id) => request.set_job_id(id.clone()),
+        None => request.set_job_id(generate_random_string(7)),
+    }
+    request.set_partition(node_idx);
+    request.set_doget(doget_idx, n_doget);
     request.search_info.timeout = timeout as i64;
     request.query_identifier.enrich_mode = enrich_mode;
 
@@ -515,6 +565,41 @@ mod tests {
         let new_err = Arc::new(parking_lot::Mutex::new("pre-set".to_string()));
         let exec = exec.with_partial_err(new_err.clone());
         assert_eq!(*exec.partial_err().lock(), "pre-set");
+    }
+
+    #[test]
+    fn test_compute_n_doget_disabled_is_always_one() {
+        assert_eq!(compute_n_doget(false, 16, 4), 1);
+        assert_eq!(compute_n_doget(false, 1, 1), 1);
+    }
+
+    #[test]
+    fn test_compute_n_doget_splits_buckets_across_nodes() {
+        // 8 target partitions / 2 nodes => 4 streams per node (8 total).
+        assert_eq!(compute_n_doget(true, 8, 2), 4);
+        // 6 / 3 => 2 per node.
+        assert_eq!(compute_n_doget(true, 6, 3), 2);
+    }
+
+    #[test]
+    fn test_compute_n_doget_more_nodes_than_partitions_is_one() {
+        // 2 target partitions / 4 nodes => 1 stream per node (can't go below one).
+        assert_eq!(compute_n_doget(true, 2, 4), 1);
+    }
+
+    #[test]
+    fn test_compute_n_doget_zero_nodes_does_not_panic() {
+        // Guarded division: no panic even with zero nodes.
+        assert_eq!(compute_n_doget(true, 8, 0), 8);
+    }
+
+    #[test]
+    fn test_remote_scan_exec_no_fanout_partitions_equal_nodes() {
+        // Flag defaults off in tests, so partitions == nodes.len() and n_doget == 1.
+        let exec = make_remote_exec();
+        assert_eq!(exec.partitions, 1);
+        assert_eq!(exec.n_doget, 1);
+        assert!(exec.shared_job_id.is_none());
     }
 
     #[test]

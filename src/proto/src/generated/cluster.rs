@@ -3309,6 +3309,12 @@ pub struct QueryIdentifier {
     /// need special logic for loading enrich table
     #[prost(bool, tag = "6")]
     pub enrich_mode: bool,
+    /// which bucket-group this do_get streams back (0-based)
+    #[prost(uint32, tag = "7")]
+    pub doget_index: u32,
+    /// total do_get streams the leader opens to this node (1 = no fan-out)
+    #[prost(uint32, tag = "8")]
+    pub doget_count: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SearchInfo {

@@ -1090,6 +1090,12 @@ pub struct Common {
     )]
     pub feature_partial_reduce_enabled: bool,
     #[env_config(
+        name = "ZO_FEATURE_FLIGHT_DOGET_FANOUT_ENABLED",
+        default = false,
+        help = "Open multiple parallel Flight do_get streams per follower (one per bucket-group) instead of a single stream. Total streams across followers ~= the leader's target partitions. EXPERIMENTAL: requires the follower shared-execution registry; leave off until that path is validated on a cluster."
+    )]
+    pub feature_flight_doget_fanout_enabled: bool,
+    #[env_config(
         name = "ZO_FEATURE_SHARED_MEMTABLE_ENABLED",
         default = false,
         help = "Enable shared memtable across multiple organizations"

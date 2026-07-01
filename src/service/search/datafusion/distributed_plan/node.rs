@@ -66,6 +66,8 @@ impl RemoteScanNodes {
             partition: 0,           // set in FlightSearchRequest
             job_id: "".to_string(), // set in FlightSearchRequest
             enrich_mode: false,     // set in RemoteScanExec
+            doget_index: 0,         // set in RemoteScanExec
+            doget_count: 1,         // set in RemoteScanExec
         };
 
         let search_infos = SearchInfos {
