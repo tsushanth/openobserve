@@ -108,11 +108,15 @@ impl FlightService for FlightServiceImpl {
 
         // do_get fan-out: the leader opens several parallel streams to this follower, all sharing
         // one job_id (hence one trace_id). They share a single execution and split its per-bucket
-        // output streams; the first request builds it, the rest take their group. EXPERIMENTAL,
-        // gated behind ZO_FEATURE_FLIGHT_DOGET_FANOUT_ENABLED.
+        // output streams; the first request builds it, the rest take their group.
+        //
+        // ZO_FEATURE_FLIGHT_DOGET_FANOUT_ENABLED gates the LEADER's decision to fan out; a
+        // follower must honor doget_count > 1 unconditionally. Checking the local flag here
+        // would, on config drift, send every fan-out request down the legacy path — N full
+        // executions each returning ALL buckets, silently multiplying the leader's data by N.
         let doget_count = req.query_identifier.doget_count as usize;
         let doget_index = req.query_identifier.doget_index as usize;
-        if cfg.common.feature_flight_doget_fanout_enabled && doget_count > 1 {
+        if doget_count > 1 {
             let shared = doget_registry::get_or_build(trace_id.clone(), {
                 let trace_id = trace_id.clone();
                 let req = req.clone();
@@ -121,28 +125,26 @@ impl FlightService for FlightServiceImpl {
             })
             .await?;
 
-            let my_streams = shared.take_group(doget_index, doget_count);
-            // report per-execution stats/metrics/lock exactly once, on the first stream
-            let custom_messages = if doget_index == 0 {
-                shared.take_custom_messages()
-            } else {
-                Vec::new()
-            };
+            // duplicate/retried requests get an error here instead of a silent empty stream
+            let my_streams = shared.take_group(doget_index, doget_count)?;
+            // per-execution stats/metrics are reported exactly once: the first request to reach
+            // this point takes them, so they survive even if a sibling request never arrives
+            let custom_messages = shared.take_custom_messages();
 
             let start = std::time::Instant::now();
             let write_options: IpcWriteOptions = IpcWriteOptions::default()
                 .try_with_compression(Some(CompressionType::ZSTD))
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let mut builder = FlightEncoderStreamBuilder::new(write_options, 33554432)
+            let mut encoder = FlightEncoderStreamBuilder::new(write_options, 33554432)
                 .with_trace_id(trace_id.to_string())
                 .with_is_super(is_super_cluster)
-                // the shared execution owns session/slot cleanup for all its streams
+                // the shared execution owns session/slot cleanup for all its streams; the guard
+                // delays that cleanup until this response's encoder tasks have fully stopped
                 .with_skip_session_cleanup(true)
-                .with_start(start);
-            for message in custom_messages {
-                builder = builder.with_custom_message(message);
-            }
-            let mut encoder = builder.build(my_streams, span);
+                .with_cleanup_guard(shared.clone())
+                .with_start(start)
+                .with_custom_messages(custom_messages)
+                .build(my_streams, span);
 
             let stream = async_stream::stream! {
                 // keep the shared execution alive until this response finishes; the last response
@@ -257,22 +259,14 @@ impl FlightService for FlightServiceImpl {
                 Status::internal(e.to_string())
             })?;
 
-        // used for EXPLAIN ANALYZE to collect metrics after stream is done
-        let metrics = req.search_info.is_analyze.then_some(MetricsInfo {
-            plan: plan.clone(),
+        // per-execution stats/metrics/partial-err handed to the leader as custom messages
+        let custom_messages = collect_custom_messages(
+            &ctx,
+            &plan,
+            scan_stats,
             is_super_cluster,
-            func: Box::new(super_cluster_enabled),
-        });
-
-        // Get the peak memory usage from the memory pool
-        // Note: We get peak memory after stream execution, so we pass it via a shared reference
-        let peak_memory = get_peak_memory_from_ctx(&ctx);
-
-        // used for super cluster follower leader to get information from follower node
-        let scan_stats_ref = get_scan_stats(&plan);
-        let metrics_ref = get_cluster_metrics(&plan);
-        let peak_memory_ref = get_peak_memory(&plan);
-        let partial_err_ref = get_partial_err(&plan);
+            req.search_info.is_analyze,
+        );
 
         // One stream per output partition so they encode in parallel
         let streams =
@@ -293,16 +287,7 @@ impl FlightService for FlightServiceImpl {
             .with_is_super(is_super_cluster)
             .with_defer_lock(lock)
             .with_start(start)
-            .with_custom_message(PreCustomMessage::ScanStats(scan_stats))
-            .with_custom_message(PreCustomMessage::ScanStatsRef(scan_stats_ref))
-            .with_custom_message(PreCustomMessage::Metrics(metrics))
-            .with_custom_message(PreCustomMessage::MetricsRef(metrics_ref))
-            .with_custom_message(PreCustomMessage::PeakMemoryRef(Some(peak_memory)))
-            .with_custom_message(PreCustomMessage::PeakMemoryRef(peak_memory_ref))
-            .with_custom_message(PreCustomMessage::PartialErrRefEarly(
-                partial_err_ref.clone(),
-            ))
-            .with_custom_message(PreCustomMessage::PartialErrRef(partial_err_ref))
+            .with_custom_messages(custom_messages)
             .build(streams, span);
 
         let stream = async_stream::stream! {
@@ -464,16 +449,13 @@ async fn build_shared_exec(
         }
     };
 
-    let peak_memory = get_peak_memory_from_ctx(&ctx);
-    let scan_stats_ref = get_scan_stats(&physical_plan);
-    let metrics_ref = get_cluster_metrics(&physical_plan);
-    let peak_memory_ref = get_peak_memory(&physical_plan);
-    let partial_err_ref = get_partial_err(&physical_plan);
-    let metrics = req.search_info.is_analyze.then_some(MetricsInfo {
-        plan: physical_plan.clone(),
+    let custom_messages = collect_custom_messages(
+        &ctx,
+        &physical_plan,
+        scan_stats,
         is_super_cluster,
-        func: Box::new(super_cluster_enabled),
-    });
+        req.search_info.is_analyze,
+    );
 
     // one stream per output partition (bucket) so they encode in parallel
     let streams =
@@ -486,7 +468,39 @@ async fn build_shared_exec(
             Status::internal(e.to_string())
         })?;
 
-    let custom_messages = vec![
+    Ok(doget_registry::new_shared(
+        trace_id,
+        ctx,
+        streams,
+        custom_messages,
+        lock,
+    ))
+}
+
+/// The custom messages appended to a do_get response: per-execution scan stats, EXPLAIN ANALYZE
+/// metrics, peak memory, and partial-error refs. Shared by the single-stream path and the
+/// fan-out shared execution so the leader receives the same set either way.
+fn collect_custom_messages(
+    ctx: &datafusion::prelude::SessionContext,
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    scan_stats: ScanStats,
+    is_super_cluster: bool,
+    is_analyze: bool,
+) -> Vec<PreCustomMessage> {
+    // used for EXPLAIN ANALYZE to collect metrics after stream is done
+    let metrics = is_analyze.then_some(MetricsInfo {
+        plan: plan.clone(),
+        is_super_cluster,
+        func: Box::new(super_cluster_enabled),
+    });
+    // peak memory is read after stream execution, so it travels via shared references
+    let peak_memory = get_peak_memory_from_ctx(ctx);
+    // used for super cluster follower leader to get information from follower node
+    let scan_stats_ref = get_scan_stats(plan);
+    let metrics_ref = get_cluster_metrics(plan);
+    let peak_memory_ref = get_peak_memory(plan);
+    let partial_err_ref = get_partial_err(plan);
+    vec![
         PreCustomMessage::ScanStats(scan_stats),
         PreCustomMessage::ScanStatsRef(scan_stats_ref),
         PreCustomMessage::Metrics(metrics),
@@ -495,15 +509,7 @@ async fn build_shared_exec(
         PreCustomMessage::PeakMemoryRef(peak_memory_ref),
         PreCustomMessage::PartialErrRefEarly(partial_err_ref.clone()),
         PreCustomMessage::PartialErrRef(partial_err_ref),
-    ];
-
-    Ok(doget_registry::new_shared(
-        trace_id,
-        ctx,
-        streams,
-        custom_messages,
-        lock,
-    ))
+    ]
 }
 
 fn clear_session_data(trace_id: &str) {

@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{collections::VecDeque, pin::Pin, task::Poll};
+use std::{collections::VecDeque, pin::Pin, sync::Arc, task::Poll};
 
 use arrow::ipc::writer::IpcWriteOptions;
 use arrow_flight::{FlightData, error::FlightError};
@@ -44,6 +44,10 @@ pub struct FlightEncoderStreamBuilder {
     /// When several do_get streams share one execution (do_get fan-out), only the shared owner
     /// clears the session / releases the slot. The per-stream encoders skip that cleanup.
     skip_session_cleanup: bool,
+    /// Opaque handle kept alive until this stream's encoder tasks have fully stopped. The
+    /// fan-out path passes its `Arc<SharedExec>` here so the shared cleanup cannot run while
+    /// an aborted task of this response might still read session data.
+    cleanup_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl FlightEncoderStreamBuilder {
@@ -57,6 +61,7 @@ impl FlightEncoderStreamBuilder {
             defer_lock: None,
             start: std::time::Instant::now(),
             skip_session_cleanup: false,
+            cleanup_guard: None,
         }
     }
 
@@ -88,6 +93,19 @@ impl FlightEncoderStreamBuilder {
     /// Skip session/slot cleanup on drop; the shared execution owner cleans up once instead.
     pub fn with_skip_session_cleanup(mut self, skip: bool) -> Self {
         self.skip_session_cleanup = skip;
+        self
+    }
+
+    /// Hold `guard` until this stream's encoder tasks have fully stopped (see
+    /// `FlightEncoderStreamBuilder::cleanup_guard`).
+    pub fn with_cleanup_guard(mut self, guard: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self.cleanup_guard = Some(guard);
+        self
+    }
+
+    /// Append several custom messages at once.
+    pub fn with_custom_messages(mut self, messages: Vec<PreCustomMessage>) -> Self {
+        self.custom_messages.extend(messages);
         self
     }
 
@@ -143,11 +161,13 @@ impl FlightEncoderStreamBuilder {
             custom_messages: self.custom_messages,
             first_data: true,
             done: false,
+            pending_error: None,
             ctx: StreamContext {
                 trace_id: self.trace_id,
                 is_super: self.is_super,
                 defer_lock: self.defer_lock,
                 skip_session_cleanup: self.skip_session_cleanup,
+                cleanup_guard: self.cleanup_guard,
                 start: self.start,
                 span,
                 child_span,
@@ -174,6 +194,9 @@ pub struct FlightEncoderStream {
     custom_messages: Vec<PreCustomMessage>,
     first_data: bool,
     done: bool,
+    /// Terminal error deferred until the already-encoded queue (including the custom messages
+    /// flushed on failure) has been yielded, so stats still reach the leader ahead of the error.
+    pending_error: Option<tonic::Status>,
     /// query context + resources consumed by the stream's `Drop` teardown.
     ctx: StreamContext,
     /// per-message logging.
@@ -186,6 +209,8 @@ struct StreamContext {
     /// set only for super cluster follower leader.
     defer_lock: Option<DeferredLock>,
     skip_session_cleanup: bool,
+    /// held until this stream's encoder tasks have fully stopped (do_get fan-out).
+    cleanup_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
     start: std::time::Instant,
     span: tracing::Span,
     child_span: tracing::Span,
@@ -263,13 +288,29 @@ impl FlightEncoderStream {
         Ok(())
     }
 
+    /// Terminal failure: best-effort flush the pending custom messages (scan stats, partial
+    /// errors, ...) ahead of the error so the leader still records them, then drain the queue
+    /// and finally surface the error itself.
     fn fail(
         &mut self,
         e: impl std::string::ToString,
     ) -> Poll<Option<Result<FlightData, tonic::Status>>> {
-        self.done = true;
-        self.queue.clear();
-        Poll::Ready(Some(Err(tonic::Status::internal(e.to_string()))))
+        if let Err(enc_err) = self.encode_custom_messages() {
+            log::warn!(
+                "[trace_id {}] flight->search: failed to encode custom messages on error path: {enc_err:?}",
+                self.ctx.trace_id
+            );
+        }
+        // keep the first error if several stages fail
+        self.pending_error
+            .get_or_insert_with(|| tonic::Status::internal(e.to_string()));
+        match self.queue.pop_front() {
+            Some(data) => Poll::Ready(Some(Ok(data))),
+            None => {
+                self.done = true;
+                Poll::Ready(Some(Err(self.pending_error.take().unwrap())))
+            }
+        }
     }
 
     /// Poll the next encoded group from the channel or the inline encoder.
@@ -310,6 +351,12 @@ impl Stream for FlightEncoderStream {
             if let Some(data) = this.queue.pop_front() {
                 this.log.on_message(&this.ctx.trace_id, this.ctx.is_super);
                 return Poll::Ready(Some(Ok(data)));
+            }
+
+            // 2.5 queue drained; surface a deferred terminal error (set by `fail`)
+            if let Some(e) = this.pending_error.take() {
+                this.done = true;
+                return Poll::Ready(Some(Err(e)));
             }
 
             // 3. fully finished
@@ -363,8 +410,11 @@ impl Stream for FlightEncoderStream {
 impl Drop for FlightEncoderStream {
     fn drop(&mut self) {
         let ctx = &mut self.ctx;
-        // Stop partition tasks before clearing session data they may still read.
-        ctx.tasks.abort_all();
+        // abort() only SCHEDULES cancellation — an aborted task can keep running until its next
+        // await point. Session/slot cleanup below therefore waits for the tasks to actually
+        // finish (in a spawned drain task) before touching state they may still read.
+        let mut tasks = std::mem::take(&mut ctx.tasks);
+        tasks.abort_all();
 
         let trace_id = &ctx.trace_id;
         let is_super = ctx.is_super;
@@ -388,27 +438,55 @@ impl Drop for FlightEncoderStream {
             .inc();
 
         // When this stream is one of several sharing a single execution (do_get fan-out), the
-        // shared owner releases the slot / clears the session exactly once, so skip it here.
+        // shared owner releases the slot / clears the session exactly once. Hold this response's
+        // guard (an Arc of the shared execution) until its tasks have fully stopped, so that
+        // shared cleanup cannot race a still-running aborted task.
         if ctx.skip_session_cleanup {
+            let cleanup_guard = ctx.cleanup_guard.take();
+            if !tasks.is_empty()
+                && let Ok(handle) = tokio::runtime::Handle::try_current()
+            {
+                handle.spawn(async move {
+                    while tasks.join_next().await.is_some() {}
+                    drop(cleanup_guard);
+                });
+            }
             return;
         }
 
-        // Release the node-level slot reservation for this Follow node.
-        #[cfg(feature = "enterprise")]
-        if get_o2_config().work_group.max_nodes_per_query > 0 {
-            o2_enterprise::enterprise::search::admission::ledger::release(trace_id);
-            log::info!("[trace_id {trace_id}] flight->search: releasing slot");
-        }
+        let trace_id = std::mem::take(&mut ctx.trace_id);
+        let defer_lock = ctx.defer_lock.take();
+        let cleanup = move || {
+            // Release the node-level slot reservation for this Follow node.
+            #[cfg(feature = "enterprise")]
+            if get_o2_config().work_group.max_nodes_per_query > 0 {
+                o2_enterprise::enterprise::search::admission::ledger::release(&trace_id);
+                log::info!("[trace_id {trace_id}] flight->search: releasing slot");
+            }
 
-        // defer is only set for super cluster follower leader
-        if let Some(defer) = ctx.defer_lock.take() {
-            drop(defer);
+            // defer is only set for super cluster follower leader
+            if let Some(defer) = defer_lock {
+                drop(defer);
+            } else {
+                // clear session data
+                clear_session_data(&trace_id);
+                log::info!(
+                    "[trace_id {trace_id}] flight->search: drop FlightEncoderStream, is_super: {is_super}",
+                );
+            }
+        };
+        if tasks.is_empty() {
+            // no encoder tasks (inline single-partition path): nothing can race, clean up now
+            cleanup();
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                // wait until every aborted task has actually stopped, then clean up
+                while tasks.join_next().await.is_some() {}
+                cleanup();
+            });
         } else {
-            // clear session data
-            clear_session_data(&ctx.trace_id);
-            log::info!(
-                "[trace_id {trace_id}] flight->search: drop FlightEncoderStream, is_super: {is_super}",
-            );
+            // no runtime (tests / process teardown): accept the small race, clean up inline
+            cleanup();
         }
     }
 }

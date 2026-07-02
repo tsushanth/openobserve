@@ -187,6 +187,16 @@ impl RemoteScanExec {
 
     pub fn set_analyze(mut self) -> Self {
         self.remote_scan_node.search_infos.is_analyze = true;
+        // EXPLAIN ANALYZE collects plan metrics when a response finishes; with fan-out the
+        // shared execution outlives the first response, so its metrics would be read too
+        // early. Analyze queries therefore stay on the single-stream path.
+        if self.n_doget > 1 {
+            self.n_doget = 1;
+            self.shared_job_id = None;
+            self.partitions = self.remote_scan_node.nodes.len();
+            self.cache =
+                Self::compute_properties(Arc::clone(&self.input.schema()), self.partitions);
+        }
         self
     }
 

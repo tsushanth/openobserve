@@ -24,9 +24,12 @@
 //!
 //! EXPERIMENTAL: gated behind `ZO_FEATURE_FLIGHT_DOGET_FANOUT_ENABLED`. The lifecycle
 //! (init race, backpressure across all N groups, cleanup timing) must be validated on a live
-//! multi-node cluster before enabling in production. Known gap: a leader that crashes mid-query
-//! can leave an entry whose remaining groups never arrive; a periodic age-based GC should evict
-//! stale entries (TODO).
+//! multi-node cluster before enabling in production.
+//!
+//! Lifecycle safety nets: a failed build removes its registry entry so failed queries don't pin
+//! the map; entries whose remaining groups never arrive (leader crashed mid-query) are lazily
+//! evicted after `2 x query_timeout` on the next registry access, which drops the last
+//! `Arc<SharedExec>` and runs the one-time session/slot cleanup.
 
 use std::{
     collections::HashMap,
@@ -35,6 +38,7 @@ use std::{
         Arc, LazyLock,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use datafusion::{execution::SendableRecordBatchStream, prelude::SessionContext};
@@ -46,8 +50,31 @@ use crate::service::search::work_group::DeferredLock;
 
 type SharedCell = Arc<tokio::sync::OnceCell<Arc<SharedExec>>>;
 
-static REGISTRY: LazyLock<Mutex<HashMap<String, SharedCell>>> =
+struct RegistryEntry {
+    created_at: Instant,
+    cell: SharedCell,
+}
+
+static REGISTRY: LazyLock<Mutex<HashMap<String, RegistryEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Evict entries older than `2 x query_timeout`: their leader can no longer legitimately come
+/// back for the remaining groups (every do_get carries a timeout <= query_timeout). Dropping an
+/// evicted entry's last `Arc<SharedExec>` runs the one-time session/slot cleanup in its Drop.
+/// Called with the registry lock held.
+fn sweep_stale(registry: &mut HashMap<String, RegistryEntry>) {
+    let ttl_secs = config::get_config().limit.query_timeout.saturating_mul(2);
+    let ttl = std::time::Duration::from_secs(ttl_secs.max(60));
+    registry.retain(|key, entry| {
+        let keep = entry.created_at.elapsed() < ttl;
+        if !keep {
+            log::warn!(
+                "[trace_id {key}] flight->search: evicting stale do_get fan-out entry (leader never claimed all groups)"
+            );
+        }
+        keep
+    });
+}
 
 /// A single follower execution whose per-partition output streams are handed out to the leader's
 /// N parallel `do_get` requests.
@@ -71,11 +98,16 @@ impl SharedExec {
     /// Take this request's contiguous bucket-group of streams. The last group absorbs any
     /// remainder when the bucket count does not divide evenly across the requests. Evicts the
     /// registry entry once every slot has been claimed.
+    ///
+    /// A non-empty group whose slots were already claimed is a duplicate/retried request; it
+    /// gets an error rather than an empty stream, so the leader sees a failure instead of
+    /// silently missing that group's data. An empty range (`bucket count < doget_count`) is
+    /// legitimate and returns an empty vec (clean EOF with no data by design).
     pub fn take_group(
         &self,
         doget_index: usize,
         doget_count: usize,
-    ) -> Vec<SendableRecordBatchStream> {
+    ) -> Result<Vec<SendableRecordBatchStream>, Status> {
         let (lo, hi) = group_range(self.streams.len(), doget_index, doget_count);
         let mut out = Vec::with_capacity(hi.saturating_sub(lo));
         for slot in &self.streams[lo..hi] {
@@ -86,16 +118,22 @@ impl SharedExec {
         // count slots this call actually claimed (not the range width), so a retried request
         // that finds its slots already taken doesn't underflow the counter
         let taken = out.len();
+        if taken == 0 && lo < hi {
+            return Err(Status::internal(format!(
+                "[trace_id {}] flight->search: do_get fan-out group {doget_index}/{doget_count} was already taken (duplicate or retried request)",
+                self.trace_id
+            )));
+        }
         if taken > 0 && self.remaining.fetch_sub(taken, Ordering::AcqRel) == taken {
             // all buckets claimed -> drop the registry handle. The `Arc<SharedExec>` lives on in
             // the in-flight responses and is freed (running cleanup) when the last one finishes.
             REGISTRY.lock().remove(&self.trace_id);
         }
-        out
+        Ok(out)
     }
 
-    /// Custom messages for the leader; returns them once (for `doget_index == 0`) and an empty
-    /// vec for every other request, so per-execution stats are reported exactly once.
+    /// Custom messages for the leader; the first request to call this takes them, every later
+    /// call gets an empty vec, so per-execution stats are reported to the leader exactly once.
     pub fn take_custom_messages(&self) -> Vec<PreCustomMessage> {
         self.custom_messages.lock().take().unwrap_or_default()
     }
@@ -124,15 +162,40 @@ impl Drop for SharedExec {
 }
 
 /// Get the shared execution for `key`, building it once. The first caller runs `build`; the rest
-/// await and share its result. On build error nothing is cached, so a later request may retry.
+/// await and share its result. On build error the entry is removed so failed queries don't pin
+/// the registry; a waiting concurrent request retries the build via its own closure.
 pub async fn get_or_build<F, Fut>(key: String, build: F) -> Result<Arc<SharedExec>, Status>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Arc<SharedExec>, Status>>,
 {
-    let cell = { REGISTRY.lock().entry(key).or_default().clone() };
-    let shared = cell.get_or_try_init(build).await?;
-    Ok(shared.clone())
+    let cell = {
+        let mut registry = REGISTRY.lock();
+        sweep_stale(&mut registry);
+        registry
+            .entry(key.clone())
+            .or_insert_with(|| RegistryEntry {
+                created_at: Instant::now(),
+                cell: SharedCell::default(),
+            })
+            .cell
+            .clone()
+    };
+    match cell.get_or_try_init(build).await {
+        Ok(shared) => Ok(shared.clone()),
+        Err(e) => {
+            // Drop the entry if it is still uninitialized so it doesn't leak. A concurrent
+            // waiter that succeeds after this check keeps its own cell handle and finishes
+            // normally; a fresh request would then rebuild, which is safe (new execution).
+            let mut registry = REGISTRY.lock();
+            if let Some(entry) = registry.get(&key)
+                && entry.cell.get().is_none()
+            {
+                registry.remove(&key);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Wrap a freshly executed plan's per-partition output streams into a `SharedExec`. `trace_id` is
