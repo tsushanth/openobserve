@@ -142,7 +142,6 @@ test.describe("Logs No-Stream Quick Pick testcases", () => {
     if (count < 8) {
       testLogger.info(`Quick pick shows ${count} buttons (≤ 8), skipping more-footer test`);
       test.skip(true, `Org has fewer than 8 streams (${count} visible), more-footer not applicable`);
-      return;
     }
 
     // Footer should be visible when streamList > quickPickStreams
