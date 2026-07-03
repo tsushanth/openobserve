@@ -15,6 +15,7 @@
 
 pub mod deduplication;
 pub mod deduplication_exec;
+pub mod metadata_count_exec;
 pub mod projections;
 #[cfg(feature = "vectorscan")]
 pub mod regex_projections;
