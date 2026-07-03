@@ -215,12 +215,13 @@ test.describe("Logs No-Stream Quick Pick testcases", () => {
     const newPage = await pagePromise;
     await newPage.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
 
-    // The card should open https://openobserve.ai/docs/example-queries/
-    // (see DOCS.QUERY_GUIDE in LogsNoStreamState.vue:55)
+    // The card opens https://openobserve.ai/docs/example-queries/ which
+    // redirects to /docs/user-guide/data-exploration/example-queries/.
+    // Accept any URL under openobserve.ai that contains "example-queries".
     expect(
       newPage.url(),
       'New tab URL should point to openobserve query guide docs'
-    ).toContain('openobserve.ai/docs/example-queries');
+    ).toMatch(/openobserve\.ai\/.*example-queries/);
 
     // Clean up the new tab
     await newPage.close().catch(() => {});

@@ -1007,20 +1007,43 @@ export class LogsPage {
 
     async deselectStream(streamName) {
         testLogger.info(`Deselecting stream: ${streamName}`);
-        // Legacy q-select used `log-search-index-list-stream-toggle-<name> div`;
-        // post-OSelect migration that data-test is gone. Pick the same option
-        // by `data-test-value` — toggling an already-selected option deselects
-        // it in OSelect's multi-mode (selectionBehavior=toggle).
-        const streamDropdown = this.page.locator(this.indexDropDown);
-        await streamDropdown.click();
-        await this.page.waitForTimeout(500);
-        const option = this.page.locator(
-            `[data-test="log-search-index-list-select-stream-option"][data-test-value="${streamName}"]`,
+        // OSelect multi-mode with rowClickSingleSelect: clicking the option's
+        // label zone calls handleRowClickSingleSelect which *replaces* the
+        // selection — so clicking an already-selected item re-selects it.
+        // To truly toggle (deselect) we must click the checkbox zone
+        // (`[data-select-checkbox]` rendered inside each multi-select option).
+        // See OSelect.vue:456-474 (handleItemClickCapture).
+        const trigger = this.page.locator(this.indexDropDownTrigger).first();
+        const popover = this.page.locator(this.indexDropDownPopover);
+        const search = this.page.locator(this.indexDropDownSearch);
+
+        // Open popover
+        if (await trigger.count() > 0) {
+            await trigger.click();
+        } else {
+            await this.page.locator(this.indexDropDown).click();
+        }
+        await popover.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+
+        // Narrow the option list so the target row is rendered
+        if (await search.count() > 0) {
+            await search.press('ControlOrMeta+a').catch(() => {});
+            await search.press('Backspace').catch(() => {});
+            await search.fill(streamName).catch(() => {});
+        }
+
+        // Click the checkbox zone inside the option to toggle-off (deselect)
+        const checkbox = this.page.locator(
+            `[data-test="log-search-index-list-select-stream-option"][data-test-value="${streamName}"] [data-select-checkbox]`,
         );
-        if (await option.first().isVisible({ timeout: 3000 }).catch(() => false)) {
-            await option.first().click();
+        if (await checkbox.first().isVisible({ timeout: 5000 }).catch(() => false)) {
+            await checkbox.first().click();
             testLogger.info(`Deselected stream: ${streamName}`);
         }
+
+        // Close popover by clicking outside — commits the model change
+        await this.page.locator('body').click({ position: { x: 0, y: 0 } }).catch(() => {});
+        await popover.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
         await this.page.keyboard.press('Escape').catch(() => {});
     }
 
