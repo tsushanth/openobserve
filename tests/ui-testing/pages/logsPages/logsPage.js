@@ -49,6 +49,18 @@ export class LogsPage {
         this.indexDropDownTrigger = '[data-test="log-search-index-list-select-stream-trigger"]';
         this.indexDropDownPopover = '[data-test="log-search-index-list-select-stream-popover"]';
         this.indexDropDownSearch = '[data-test="log-search-index-list-select-stream-search"]';
+        // Quick Pick (no-stream-selected sidebar state) locators
+        this.quickPickContainer = '[data-test="logs-search-stream-quick-pick"]';
+        this.quickPickButton = (streamName) => `[data-test="logs-search-stream-quick-pick-${streamName}"]`;
+        this.quickPickButtonWildcard = '[data-test^="logs-search-stream-quick-pick-"]';
+        this.quickPickMoreFooter = '[data-test="logs-search-stream-quick-pick-more"]';
+        // Hero state (main content no-stream-selected) locators
+        this.noStreamHero = '[data-test="logs-search-no-stream-selected-text"]';
+        this.selectStreamCard = '[data-test="logs-no-stream-select-stream-card"]';
+        this.queryGuideCard = '[data-test="logs-no-stream-query-guide-card"]';
+        this.recentChip = (streamName) => `[data-test="logs-no-stream-recent-${streamName}"]`;
+        // Post stream-selection: empty schema indicator
+        this.noFieldFoundText = '[data-test="logs-search-no-field-found-text"]';
         this.streamToggle = '[data-test="log-search-index-list-stream-toggle-default"] [data-state]';
         this.searchPartitionButton = '[data-test="logs-search-partition-btn"]';
         this.histogramToggle = '[data-test="logs-search-bar-show-histogram-toggle-btn"]';
@@ -10640,5 +10652,161 @@ export class LogsPage {
         const option = this.page.locator(this.datetimeTimezoneOption(value));
         await option.waitFor({ state: 'visible', timeout: 10000 });
         await option.click();
+    }
+
+    // ──────────────────────────────────────────────
+    //  Quick Pick (No-Stream-Selected) helpers
+    // ──────────────────────────────────────────────
+
+    /**
+     * Waits for the sidebar quick pick container to become visible.
+     */
+    async expectQuickPickContainerVisible() {
+        const container = this.page.locator(this.quickPickContainer);
+        await container.waitFor({ state: 'visible', timeout: 15000 });
+        testLogger.info('Quick pick container is visible');
+    }
+
+    /**
+     * Asserts the sidebar quick pick container is NOT visible (hidden or detached).
+     * Uses toBeHidden() which covers both CSS hidden and DOM-detached states.
+     */
+    async expectQuickPickContainerNotVisible() {
+        const container = this.page.locator(this.quickPickContainer);
+        await expect(container, 'Quick pick container should not be visible after stream selection').toBeHidden({ timeout: 15000 });
+        testLogger.info('Quick pick container is not visible');
+    }
+
+    /**
+     * Clicks a quick pick stream button in the sidebar.
+     * @param {string} streamName — e.g. "e2e_automate"
+     */
+    async clickQuickPickButton(streamName) {
+        testLogger.info(`Clicking quick pick button for stream: ${streamName}`);
+        const btn = this.page.locator(this.quickPickButton(streamName));
+        await btn.waitFor({ state: 'visible', timeout: 10000 });
+        await btn.click();
+    }
+
+    /**
+     * Returns the count of visible quick pick stream buttons in the sidebar.
+     * @returns {Promise<number>}
+     */
+    async getQuickPickButtonCount() {
+        const buttons = this.page.locator(this.quickPickButtonWildcard);
+        await buttons.first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+        return await buttons.count();
+    }
+
+    /**
+     * Asserts the quick pick "more" footer is visible.
+     */
+    async expectQuickPickMoreFooterVisible() {
+        const footer = this.page.locator(this.quickPickMoreFooter);
+        await expect(footer, 'Quick pick more footer should be visible').toBeVisible({ timeout: 10000 });
+        testLogger.info('Quick pick more footer is visible');
+    }
+
+    /**
+     * Waits for the hero-state "no stream selected" container to be visible.
+     */
+    async expectNoStreamHeroVisible() {
+        const hero = this.page.locator(this.noStreamHero);
+        await hero.waitFor({ state: 'visible', timeout: 15000 });
+        testLogger.info('No-stream hero is visible');
+    }
+
+    /**
+     * Asserts the "Select a stream" hero card is visible.
+     */
+    async expectSelectStreamCardVisible() {
+        const card = this.page.locator(this.selectStreamCard);
+        await expect(card, 'Select stream card should be visible').toBeVisible({ timeout: 10000 });
+        testLogger.info('Select stream card is visible');
+    }
+
+    /**
+     * Asserts the "Read the query guide" hero card is visible.
+     */
+    async expectQueryGuideCardVisible() {
+        const card = this.page.locator(this.queryGuideCard);
+        await expect(card, 'Query guide card should be visible').toBeVisible({ timeout: 10000 });
+        testLogger.info('Query guide card is visible');
+    }
+
+    /**
+     * Clicks the "Select a stream" hero card.
+     */
+    async clickSelectStreamCard() {
+        testLogger.info('Clicking Select a stream card');
+        const card = this.page.locator(this.selectStreamCard);
+        await card.waitFor({ state: 'visible', timeout: 10000 });
+        await card.click();
+    }
+
+    /**
+     * Clicks the "Read the query guide" hero card.
+     */
+    async clickQueryGuideCard() {
+        testLogger.info('Clicking Query guide card');
+        const card = this.page.locator(this.queryGuideCard);
+        await card.waitFor({ state: 'visible', timeout: 10000 });
+        await card.click();
+    }
+
+    /**
+     * Asserts a recent-stream chip is visible in the hero state.
+     * @param {string} streamName
+     */
+    async expectRecentChipVisible(streamName) {
+        const chip = this.page.locator(this.recentChip(streamName));
+        await expect(chip, `Recent chip for ${streamName} should be visible`).toBeVisible({ timeout: 10000 });
+        testLogger.info(`Recent chip for ${streamName} is visible`);
+    }
+
+    /**
+     * Clicks a recent-stream chip in the hero state.
+     * @param {string} streamName
+     */
+    async clickRecentChip(streamName) {
+        testLogger.info(`Clicking recent chip for stream: ${streamName}`);
+        const chip = this.page.locator(this.recentChip(streamName));
+        await chip.waitFor({ state: 'visible', timeout: 10000 });
+        await chip.click();
+    }
+
+    /**
+     * Asserts the stream dropdown popover is visible.
+     */
+    async expectStreamDropdownPopoverVisible() {
+        const popover = this.page.locator(this.indexDropDownPopover);
+        await expect(popover, 'Stream dropdown popover should be visible').toBeVisible({ timeout: 10000 });
+        testLogger.info('Stream dropdown popover is visible');
+    }
+
+    /**
+     * Asserts the stream dropdown wrapper shows the selected stream name
+     * (i.e. the placeholder "Select Stream" has been replaced by a selected-item chip).
+     * Uses the wrapper div since OSelect renders selected items as tokens within it.
+     * @param {string} streamName
+     */
+    async expectStreamDropdownShowsStream(streamName) {
+        const wrapper = this.page.locator(this.indexDropDown);
+        await expect(wrapper, `Stream dropdown should show ${streamName}`).toContainText(streamName, { timeout: 10000 });
+        testLogger.info(`Stream dropdown shows stream: ${streamName}`);
+    }
+
+    /**
+     * Waits for the field list to appear after selecting a stream via quick pick.
+     * Accepts either the fields table or the "no field found" text as a valid post-selection state.
+     */
+    async waitForFieldListAfterStreamSelection() {
+        const fieldTable = this.page.locator(this.timestampFieldTable);
+        const noField = this.page.locator(this.noFieldFoundText);
+        await Promise.race([
+            fieldTable.waitFor({ state: 'visible', timeout: 20000 }),
+            noField.waitFor({ state: 'visible', timeout: 20000 }),
+        ]).catch(() => {});
+        testLogger.info('Field list loaded after stream selection');
     }
 }

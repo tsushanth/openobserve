@@ -1,0 +1,9 @@
+{
+  "action": "new",
+  "target_spec": "tests/ui-testing/playwright-tests/Logs/logsQuickPick.spec.js",
+  "existing_tests_considered": [
+    "tests/ui-testing/playwright-tests/Logs/logspage.spec.js"
+  ],
+  "needs_registration": false,
+  "rationale": "No existing spec covers the no-stream quick pick feature. logspage.spec.js always selects a stream in beforeEach, never tests the no-stream-selected state. A brand-new spec is warranted. Playwright config uses testDir auto-discovery (no YAML registry), so needs_registration is false."
+}

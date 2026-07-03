@@ -1,0 +1,19 @@
+{
+  "feature_slug": "logs-stream-quick-pick",
+  "feature_title": "Logs No-Stream Quick Pick",
+  "area": "Logs",
+  "edition": "oss",
+  "needs_e2e": true,
+  "needs_api": false,
+  "spec_filename": "logsQuickPick.spec.js",
+  "spec_path": "tests/ui-testing/playwright-tests/Logs/logsQuickPick.spec.js",
+  "playwright_group": "Logs-Core",
+  "source_files": [
+    "web/src/plugins/logs/Index.vue",
+    "web/src/plugins/logs/IndexList.vue",
+    "web/src/locales/languages/en.json"
+  ],
+  "existing_tests_in_diff": false,
+  "skip": false,
+  "skip_reason": ""
+}

@@ -1,0 +1,9 @@
+[
+  { "title": "should quick pick a stream from the sidebar", "action": "new", "verifies": "clicking a sidebar quick pick button selects the stream and loads the field list" },
+  { "title": "should show hero state on fresh arrival with no stream selected", "action": "new", "verifies": "the main content area shows both hero action cards when no stream is selected" },
+  { "title": "should open stream dropdown when clicking select stream card", "action": "new", "verifies": "clicking the \"Select a stream\" hero card opens the stream dropdown popover" },
+  { "title": "should reappear quick pick after deselecting and re-select works", "action": "new", "verifies": "after deselecting a stream the quick pick reappears and re-selection works correctly" },
+  { "title": "should show more footer when org has more than 8 streams", "action": "new", "verifies": "the quick pick more footer is visible with the correct remaining count when org has > 8 streams (skips otherwise)" },
+  { "title": "should select stream via hero recent chip", "action": "new", "verifies": "clicking a recent-stream chip in the hero state selects the stream and triggers field list loading" },
+  { "title": "should open query guide documentation in new tab", "action": "new", "verifies": "clicking the \"Read the query guide\" card opens the OpenObserve docs in a new browser tab" }
+]
