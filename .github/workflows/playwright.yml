@@ -232,6 +232,7 @@ jobs:
                 "monaco-query-prefill.spec.js",
                 "logsqueries.matchall.spec.js",
                 "ftsDefaultColumn.spec.js",
+                "logsQuickPick.spec.js",
               ]
           - testfolder: "Logs-Features"
             browser: "chrome"
